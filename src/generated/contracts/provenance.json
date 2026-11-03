@@ -1,0 +1,11 @@
+{
+  "repository": "mkmilan/endurance-canva-backend",
+  "commit": "5790a2901212591a293313984f81058133cf8d17",
+  "workingTreeContractChanges": false,
+  "files": {
+    "lesson.schema.json": "ada82f856813cc7e8ddaaf7bc0abe121baba19c57d0d9c29c57f598fd8e86847",
+    "catalog.v1.json": "621b40127aab123e657e8fb276a68a405e9696b07ae57b26f91a52721dfd346a",
+    "example.v1.json": "84db3a61553a79cf8aabca221cb46613b4816c820c3a184418ca68f2553aaf38",
+    "validation.js": "e1d0800011d9fa5ce866933b1d7803762cd38c192d6d3bd15c59281374103f59"
+  }
+}
