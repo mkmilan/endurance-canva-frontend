@@ -1,0 +1,125 @@
+name: Verify studio
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: studio-verification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  studio:
+    name: Build and browser verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+      BACKEND_API_URL: http://127.0.0.1:4000
+      CANVAS_TEST_URL: http://127.0.0.1:3000
+      CANVAS_QA_ARTIFACT_DIR: ${{ runner.temp }}/endurance-canvas-qa
+      BACKEND_QA_DIR: ${{ runner.temp }}/endurance-canvas-backend
+      BACKEND_REF: 5790a2901212591a293313984f81058133cf8d17
+      PLAYWRIGHT_TOOLS_DIR: ${{ runner.temp }}/endurance-canvas-playwright
+      NODE_PATH: ${{ runner.temp }}/endurance-canvas-playwright/node_modules
+    steps:
+      - name: Check out the tested frontend revision
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24.22.1'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Prepare verification artifacts
+        run: |
+          mkdir -p "$CANVAS_QA_ARTIFACT_DIR"
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          fs.writeFileSync(path.join(process.env.CANVAS_QA_ARTIFACT_DIR, 'report.json'), JSON.stringify({
+            status: 'not-run', passed: false, frontendCommit: process.env.GITHUB_SHA,
+            backendCommit: process.env.BACKEND_REF,
+            message: 'Browser verification has not started. Inspect the job logs if an earlier step failed.'
+          }, null, 2));
+          NODE
+
+      - name: Install, test, and build the frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm test 2>&1 | tee "$CANVAS_QA_ARTIFACT_DIR/frontend-tests.log"
+          npm run build 2>&1 | tee "$CANVAS_QA_ARTIFACT_DIR/frontend-build.log"
+
+      - name: Check out the published backend revision
+        run: |
+          git clone --quiet https://github.com/mkmilan/endurance-canva-backend.git "$BACKEND_QA_DIR"
+          git -C "$BACKEND_QA_DIR" checkout --detach "$BACKEND_REF"
+          test "$(git -C "$BACKEND_QA_DIR" rev-parse HEAD)" = "$BACKEND_REF"
+
+      - name: Install backend dependencies
+        working-directory: ${{ runner.temp }}/endurance-canvas-backend
+        run: npm ci --no-audit --no-fund
+
+      - name: Install the pinned browser tooling outside the repository
+        run: |
+          npm install --prefix "$PLAYWRIGHT_TOOLS_DIR" --no-save --ignore-scripts --no-audit --no-fund playwright@1.62.1
+          "$PLAYWRIGHT_TOOLS_DIR/node_modules/.bin/playwright" install --with-deps chromium
+
+      - name: Start the local guided-demo services
+        run: |
+          NODE_ENV=development AI_MODE=demo HOST=127.0.0.1 PORT=4000 node "$BACKEND_QA_DIR/src/server.js" > "$CANVAS_QA_ARTIFACT_DIR/backend.log" 2>&1 &
+          echo "$!" > "$CANVAS_QA_ARTIFACT_DIR/backend.pid"
+          NODE_ENV=production PORT=3000 npm start > "$CANVAS_QA_ARTIFACT_DIR/frontend.log" 2>&1 &
+          echo "$!" > "$CANVAS_QA_ARTIFACT_DIR/frontend.pid"
+          node - <<'NODE'
+          const { setTimeout: pause } = require('node:timers/promises');
+          async function ready(url, expected) {
+            const deadline = Date.now() + 60000;
+            let last = 'No response';
+            while (Date.now() < deadline) {
+              try {
+                const response = await fetch(url, { signal: AbortSignal.timeout(3000) });
+                const body = await response.json();
+                if (response.ok && expected(body)) return;
+                last = `HTTP ${response.status}: ${JSON.stringify(body)}`;
+              } catch (error) { last = error.message; }
+              await pause(500);
+            }
+            throw new Error(`${url} was not ready: ${last}`);
+          }
+          Promise.all([
+            ready(`${process.env.BACKEND_API_URL}/health`, value => value.status === 'ok' && value.mode === 'demo'),
+            ready(`${process.env.CANVAS_TEST_URL}/api/status`, value => value.status === 'ok' && value.mode === 'demo' && value.liveGenerationAvailable === false)
+          ]).catch(error => { console.error(error); process.exitCode = 1; });
+          NODE
+
+      - name: Exercise the studio in bundled Chromium
+        timeout-minutes: 3
+        run: node tests/studio.e2e.cjs
+
+      - name: Stop test services
+        if: always()
+        run: |
+          for service in frontend backend; do
+            if [ -f "$CANVAS_QA_ARTIFACT_DIR/$service.pid" ]; then
+              kill "$(cat "$CANVAS_QA_ARTIFACT_DIR/$service.pid")" 2>/dev/null || true
+            fi
+          done
+
+      - name: Upload browser evidence and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: studio-verification-${{ github.sha }}
+          path: ${{ runner.temp }}/endurance-canvas-qa/
+          if-no-files-found: warn
+          retention-days: 14
