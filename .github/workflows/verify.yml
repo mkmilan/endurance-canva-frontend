@@ -17,6 +17,9 @@ jobs:
     name: Build and browser verification
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
     env:
       NEXT_TELEMETRY_DISABLED: '1'
       BACKEND_API_URL: http://127.0.0.1:4000

@@ -1,13 +1,11 @@
-import { backendConfig, backendHealth, apiError } from '../../../src/lib/backend.js';
+import { backendConfig, backendHealth, apiError, isSameOriginRequest } from '../../../src/lib/backend.js';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
 export async function POST(request) {
   try {
-    const origin = request.headers.get('origin');
-    const requestOrigin = new URL(request.url).origin;
-    if (origin && origin !== requestOrigin) return apiError('This request must come from the studio.', 403, 'ORIGIN_MISMATCH');
+    if (!isSameOriginRequest(request)) return apiError('This request must come from the studio.', 403, 'ORIGIN_MISMATCH');
     if (!request.headers.get('content-type')?.includes('application/json')) return apiError('Send a JSON lesson request.', 415, 'INVALID_CONTENT_TYPE');
     const config = backendConfig();
     if (!config) return apiError('The lesson service is not connected yet. You can still edit and save your canvas.', 503, 'NOT_CONFIGURED');
