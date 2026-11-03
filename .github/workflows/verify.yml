@@ -28,7 +28,7 @@ jobs:
       CANVAS_TEST_URL: http://127.0.0.1:3000
       STUDIO_ORIGIN: http://127.0.0.1:3000
       TEST_MONGODB_URI: mongodb://127.0.0.1:27017/?replicaSet=canvas-test
-      BACKEND_REF: 80afd537d6b6896453ea4f09ef9050b2dfb85a49
+      BACKEND_REF: 259760be5e75e4690765d679085933de181561ba
     steps:
       - name: Set runtime paths
         run: |

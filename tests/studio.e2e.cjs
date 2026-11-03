@@ -54,7 +54,9 @@ async function range(value) {
 }
 
 async function saved() {
-  await page.getByText('Saved on this device', { exact: true }).waitFor();
+  // The status is deliberately hidden on phones, but its saved state still
+  // proves the asynchronous IndexedDB write completed.
+  await page.locator('.save-indicator.saved').waitFor({ state: 'attached' });
 }
 
 async function titleIs(value) {
