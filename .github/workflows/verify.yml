@@ -21,12 +21,17 @@ jobs:
       NEXT_TELEMETRY_DISABLED: '1'
       BACKEND_API_URL: http://127.0.0.1:4000
       CANVAS_TEST_URL: http://127.0.0.1:3000
-      CANVAS_QA_ARTIFACT_DIR: ${{ runner.temp }}/endurance-canvas-qa
-      BACKEND_QA_DIR: ${{ runner.temp }}/endurance-canvas-backend
       BACKEND_REF: 5790a2901212591a293313984f81058133cf8d17
-      PLAYWRIGHT_TOOLS_DIR: ${{ runner.temp }}/endurance-canvas-playwright
-      NODE_PATH: ${{ runner.temp }}/endurance-canvas-playwright/node_modules
     steps:
+      - name: Set runtime paths
+        run: |
+          {
+            printf 'CANVAS_QA_ARTIFACT_DIR=%s/endurance-canvas-qa\n' "$RUNNER_TEMP"
+            printf 'BACKEND_QA_DIR=%s/endurance-canvas-backend\n' "$RUNNER_TEMP"
+            printf 'PLAYWRIGHT_TOOLS_DIR=%s/endurance-canvas-playwright\n' "$RUNNER_TEMP"
+            printf 'NODE_PATH=%s/endurance-canvas-playwright/node_modules\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
+
       - name: Check out the tested frontend revision
         uses: actions/checkout@v7
         with:
@@ -66,8 +71,9 @@ jobs:
           test "$(git -C "$BACKEND_QA_DIR" rev-parse HEAD)" = "$BACKEND_REF"
 
       - name: Install backend dependencies
-        working-directory: ${{ runner.temp }}/endurance-canvas-backend
-        run: npm ci --no-audit --no-fund
+        run: |
+          cd "$BACKEND_QA_DIR"
+          npm ci --no-audit --no-fund
 
       - name: Install the pinned browser tooling outside the repository
         run: |
@@ -120,6 +126,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: studio-verification-${{ github.sha }}
-          path: ${{ runner.temp }}/endurance-canvas-qa/
+          path: ${{ env.CANVAS_QA_ARTIFACT_DIR }}/
           if-no-files-found: warn
           retention-days: 14
