@@ -15,7 +15,9 @@ concurrency:
 jobs:
   studio:
     name: Build and browser verification
-    runs-on: ubuntu-24.04
+    # MongoDB 8.0 currently rejects newer 6.19+ host kernels (SERVER-121912).
+    # Use the supported 22.04 runner instead of disabling MongoDB's guard.
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
     defaults:
       run:
@@ -39,7 +41,9 @@ jobs:
           node - <<'NODE'
           const fs = require('node:fs');
           const crypto = require('node:crypto');
-          fs.appendFileSync(process.env.GITHUB_ENV, `CANVAS_TEST_SETUP_TOKEN=${crypto.randomBytes(32).toString('hex')}\n`);
+          const token = crypto.randomBytes(32).toString('hex');
+          process.stdout.write(`::add-mask::${token}\n`);
+          fs.appendFileSync(process.env.GITHUB_ENV, `CANVAS_TEST_SETUP_TOKEN=${token}\n`);
           NODE
 
       - name: Check out the tested frontend revision
