@@ -187,7 +187,7 @@ async function run() {
     await check('Invalid JSON import keeps the current lesson intact', async () => {
       const previous = await snapshot();
       await page.getByLabel('Import lesson JSON file', { exact: true }).setInputFiles({ name: 'invalid.json', mimeType: 'application/json', buffer: Buffer.from('{"bad":true}') });
-      await page.getByRole('alert').waitFor();
+      await page.locator('.toast[role="alert"]').filter({ hasText: 'This is not a supported Endurance Canvas lesson file.' }).waitFor();
       assert.deepEqual(await snapshot(), previous);
       await page.getByRole('button', { name: 'Dismiss notification', exact: true }).click();
     });
