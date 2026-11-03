@@ -8,6 +8,7 @@ import SourcesPanel from './SourcesPanel.js';
 import { copy, createLesson, reviseLesson, undoLesson, exportLesson, importLesson, validStoredLesson, filename, downloadBlob } from '../lib/lessons.js';
 import { validateLesson } from '../generated/contracts/validation.js';
 import { saveLocalLesson, listLocalLessons, loadActiveLesson, deleteLocalLesson } from '../lib/storage.js';
+import { creatorRequest, signedOutCreator, attemptAllowance } from '../lib/creator.js';
 
 const initialMessage = { role: 'assistant', text: 'Let’s make an idea easier to understand. Start with three training zones, then ask me to simplify the explanation, add detail, or try another example.' };
 const promptSuggestions = ['Explain three training zones', 'Make it simpler', 'Show an example above LT2'];
@@ -26,6 +27,8 @@ export default function Studio() {
   const [notice, setNotice] = useState(null);
   const [saveState, setSaveState] = useState('loading');
   const [connection, setConnection] = useState({state:'connecting',mode:'demo'});
+  const [creator, setCreator] = useState(signedOutCreator);
+  const [generationMode, setGenerationMode] = useState('demo');
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [saved, setSaved] = useState([]);
   const [exportOpen, setExportOpen] = useState(false);
@@ -36,8 +39,12 @@ export default function Studio() {
   const transcriptRef = useRef(null);
   const importRef = useRef(null);
   const drawerRef = useRef(null);
+  const creatorRequestRef = useRef(0);
+  const creatorNavigationRef = useRef(false);
   const content = candidate?.content || lesson.content;
   const reviewed = !candidate && lesson.reviewedRevision === lesson.revision;
+  const allowance = attemptAllowance(creator.ai?.limits);
+  const liveReady = Boolean(creator.auth.signedIn && creator.ai?.available && !allowance.exhausted);
 
   function notify(text, kind='success') { setNotice({text,kind,id:Date.now()}); }
   function replaceLesson(next, message) {
@@ -59,6 +66,17 @@ export default function Studio() {
       setConnection({state:'connected',mode:result.mode});
     }catch{setConnection({state:'offline',mode:'demo'});}
   }
+  async function refreshCreator() {
+    const id=++creatorRequestRef.current;
+    try {
+      const result=await creatorRequest();
+      if(id!==creatorRequestRef.current)return;
+      setCreator(result);
+      if(!result.auth?.signedIn || !result.ai?.available)setGenerationMode('demo');
+    }catch{
+      if(id===creatorRequestRef.current){setCreator(signedOutCreator);setGenerationMode('demo');}
+    }
+  }
 
   useEffect(()=>{
     let mounted=true;
@@ -70,7 +88,10 @@ export default function Studio() {
       } else if(stored) notify('The last saved lesson could not be restored. Import a JSON backup to recover it.','error');
     }).catch(error=>mounted&&notify(error.message,'error')).finally(()=>mounted&&setReady(true));
     checkConnection();
-    return()=>{mounted=false;requestRef.current?.controller.abort();};
+    refreshCreator();
+    const onFocus=()=>refreshCreator();
+    window.addEventListener('focus',onFocus);
+    return()=>{mounted=false;requestRef.current?.controller.abort();requestRef.current=null;creatorRequestRef.current++;window.removeEventListener('focus',onFocus);};
   },[]);
 
   useEffect(()=>{
@@ -117,6 +138,8 @@ export default function Studio() {
   async function generate(text=prompt) {
     const value=text.trim();if(!value || pending)return;
     if(candidate){notify('Use or dismiss the current suggestion before asking for another.','error');return;}
+    if(generationMode==='live' && !liveReady){notify('Live AI is not available right now. Choose the guided demo to keep exploring.','error');return;}
+    const requestedMode=generationMode;
     const base=lessonRef.current;
     const requestId=crypto.randomUUID(),controller=new AbortController();
     requestRef.current={id:requestId,controller};setPending(true);setPrompt('');
@@ -124,11 +147,14 @@ export default function Studio() {
     try{
       const response=await fetch('/api/generate',{
         method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({requestId,mode:'refine',prompt:value,currentContent:base.content,baseRevision:base.revision}),signal:controller.signal,
+        body:JSON.stringify({requestId,generationMode:requestedMode,mode:'refine',prompt:value,currentContent:base.content,baseRevision:base.revision}),signal:controller.signal,
       });
       const result=await response.json();
       if(requestRef.current?.id!==requestId)return;
-      if(!response.ok)throw new Error(result.error?.message||'The lesson service could not complete this request.');
+      if(!response.ok){
+        if(response.status===401){setCreator({...signedOutCreator,auth:{...creator.auth,signedIn:false,user:undefined}});setGenerationMode('demo');}
+        throw new Error(result.error?.message||'The lesson service could not complete this request.');
+      }
       if(lessonRef.current.id!==base.id || lessonRef.current.revision!==base.revision){
         appendMessage({role:'assistant',text:'You changed the canvas while this request was running, so I kept your newer version. Ask again when you are ready.'});return;
       }
@@ -138,16 +164,16 @@ export default function Studio() {
       if(result.requestId!==requestId || result.baseRevision!==base.revision)throw new Error('The response did not match this draft. Your canvas is unchanged.');
       const check=validateLesson(result.content);
       if(!check.valid)throw new Error('This suggestion did not pass the lesson checks. Your canvas is unchanged.');
-      setCandidate({content:result.content,lessonId:base.id,baseRevision:base.revision});
+      setCandidate({content:result.content,lessonId:base.id,baseRevision:base.revision,generationMode:result.mode||requestedMode});
       setPower(result.content.visual.defaultPower);setTab('preview');
-      appendMessage({role:'assistant',text:result.message||'Your suggestion is ready to explore. Use this version when you are happy with it.'});
+      appendMessage({role:'assistant',generationMode:result.mode||requestedMode,text:result.message||'Your suggestion is ready to explore. Use this version when you are happy with it.'});
       setConnection({state:'connected',mode:result.mode||'demo'});
       setMobilePane('canvas');
     }catch(error){
       if(requestRef.current?.id!==requestId || lessonRef.current.id!==base.id)return;
       if(error.name==='AbortError')appendMessage({role:'assistant',text:'Stopped. Your current lesson is unchanged.'});
       else{appendMessage({role:'assistant',text:error.message,error:true});notify(error.message,'error');}
-    }finally{if(requestRef.current?.id===requestId){setPending(false);requestRef.current=null;}}
+    }finally{if(requestRef.current?.id===requestId){setPending(false);requestRef.current=null;if(requestedMode==='live')refreshCreator();}}
   }
 
   function applyContent(next,message='Changes applied. A new draft revision is ready.'){
@@ -173,6 +199,16 @@ export default function Studio() {
     const snapshot=lessonRef.current;
     try{await saveLocalLesson(snapshot);if(lessonRef.current.id!==snapshot.id || lessonRef.current.revision!==snapshot.revision){notify('Your lesson changed while saving. Please try again.','error');return false;}return true;}
     catch(error){notify(error.message,'error');return false;}
+  }
+  async function openCreator(event){
+    // Modifier clicks open another tab and leave this draft mounted.
+    if(event.defaultPrevented || event.button!==0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)return;
+    event.preventDefault();
+    if(!ready){notify('Your saved lesson is still opening. Try again in a moment.','error');return;}
+    if(creatorNavigationRef.current)return;
+    creatorNavigationRef.current=true;
+    if(await flushCurrent())window.location.assign('/creator');
+    else creatorNavigationRef.current=false;
   }
   async function startNew(){
     if(!await flushCurrent())return;
@@ -231,16 +267,17 @@ export default function Studio() {
     <header className="studio-header">
       <a className="brand" href="/" aria-label="Endurance Canvas home"><span className="brand-mark"><svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true"><path d="M7 24V13m9 11V7m9 17v-8" fill="none" stroke="currentColor" strokeWidth="4" strokeLinecap="round"/></svg></span><span>Endurance <strong>Canvas</strong></span></a>
       <span className="header-divider"/><span className="header-studio">Studio <span className="version-badge">EARLY ACCESS</span></span>
-      <div className="header-actions"><span className={`save-indicator ${saveState}`}><span/>{saveState==='saved'?'Saved on this device':saveState==='saving'?'Saving…':saveState==='error'?'Not saved':'Opening studio…'}</span><button className="button ghost library-button" aria-label="My lessons" onClick={openLibrary}><Icon name="folder"/><span>My lessons</span></button><button className="button primary header-save" aria-label="Save lesson" onClick={saveNow} disabled={!ready}><Icon name="save"/><span>Save lesson</span></button></div>
+      <div className="header-actions"><span className={`save-indicator ${saveState}`}><span/>{saveState==='saved'?'Saved on this device':saveState==='saving'?'Saving…':saveState==='error'?'Not saved':'Opening studio…'}</span><a className="button ghost creator-link" href="/creator" onClick={openCreator} aria-label={creator.auth.signedIn?`Creator account: ${creator.auth.user?.name||'Creator'}`:'Creator access'}><Icon name="user"/><span>{creator.auth.signedIn?creator.auth.user?.name||'Creator':'Creator access'}</span></a><button className="button ghost library-button" aria-label="My lessons" onClick={openLibrary}><Icon name="folder"/><span>My lessons</span></button><button className="button primary header-save" aria-label="Save lesson" onClick={saveNow} disabled={!ready}><Icon name="save"/><span>Save lesson</span></button></div>
     </header>
     <div className="workspace-heading"><div><span className="eyebrow">A LITTLE CURIOSITY. A CLEARER PICTURE.</span><h1>Make the science click<span>.</span></h1></div><button className="button secondary" onClick={startNew} disabled={!ready}><Icon name="plus"/>New lesson</button></div>
     <div className="mobile-pane-tabs" role="tablist" aria-label="Workspace view"><button role="tab" aria-selected={mobilePane==='conversation'} onClick={()=>setMobilePane('conversation')}><Icon name="sparkles" size={16}/>Conversation{pending&&<span className="tab-dot"/>}</button><button role="tab" aria-selected={mobilePane==='canvas'} onClick={()=>setMobilePane('canvas')}><Icon name="eye" size={16}/>Your canvas{candidate&&<span className="tab-dot"/>}</button></div>
     <main className={`workspace mobile-${mobilePane}`}>
       <aside className="conversation-panel" aria-label="Lesson conversation">
-        <div className="conversation-header"><span className="small-icon"><Icon name="sparkles" size={18}/></span><div><h2>Your thinking partner</h2><p>One idea, made interactive.</p></div><span className="demo-badge">GUIDED DEMO</span></div>
-        <div className="demo-note"><span className="demo-dot"/><p>This first version uses prepared explanations.<br/>Live AI will come in a later step.</p></div>
+        <div className="conversation-header"><span className="small-icon"><Icon name="sparkles" size={18}/></span><div><h2>Your thinking partner</h2><p>One idea, made interactive.</p></div><span className={`demo-badge ${generationMode==='live'?'live-badge':''}`}>{generationMode==='live'?'LIVE AI':'GUIDED DEMO'}</span></div>
+        {creator.auth.signedIn&&<div className="generation-controls"><div className="generation-toggle" role="group" aria-label="Generation mode"><button type="button" aria-pressed={generationMode==='demo'} onClick={()=>setGenerationMode('demo')} disabled={pending}>Guided demo</button><button type="button" aria-pressed={generationMode==='live'} onClick={()=>setGenerationMode('live')} disabled={pending||!liveReady} aria-describedby="generation-availability"><Icon name="sparkles" size={13}/>Live AI</button></div><p className="generation-availability" id="generation-availability">{!creator.ai?.available?'The AI connection is not configured yet. Keep exploring with the guided demo.':allowance.exhausted?'Your AI allowance is used for now. The guided demo is still available.':'Live AI is ready when you choose it.'}</p>{creator.ai?.available&&allowance.description&&<p className="generation-allowance" aria-live="polite">{allowance.description}</p>}</div>}
+        <div className={`demo-note ${generationMode==='live'?'live-note':''}`}><span className="demo-dot"/><p>{generationMode==='live'?'AI creates a draft from the lesson’s source notes. Review its explanation, assumptions and sources before sharing.':'The guided demo uses prepared explanations. Explore an idea, then make it your own.'}</p></div>
         <div className="conversation-scroll" ref={transcriptRef} aria-live="polite" aria-relevant="additions text">
-          {messages.map((message,index)=><div className={`message ${message.role} ${message.error?'message-error':''}`} key={index}>{message.role==='assistant'&&<span className="message-avatar"><Icon name="sparkles" size={14}/></span>}<div><span className="message-name">{message.role==='user'?'YOU':'CANVAS'}</span><p>{message.text}</p></div></div>)}
+          {messages.map((message,index)=><div className={`message ${message.role} ${message.error?'message-error':''}`} key={index}>{message.role==='assistant'&&<span className="message-avatar"><Icon name="sparkles" size={14}/></span>}<div><span className="message-name">{message.role==='user'?'YOU':message.generationMode==='live'?'CANVAS · AI GENERATED':'CANVAS'}</span><p>{message.text}</p></div></div>)}
           {pending&&<div className="message assistant"><span className="message-avatar"><Icon name="sparkles" size={14}/></span><div><span className="message-name">CANVAS</span><p className="thinking"><span/><span/><span/>Preparing your suggestion…</p></div></div>}
           {candidate&&<div className="suggestion-note"><Icon name="eye" size={17}/><span>Your suggestion is on the canvas. Explore it, then choose whether to keep it.</span></div>}
         </div>
@@ -251,7 +288,7 @@ export default function Studio() {
       </aside>
       <section className="canvas-panel" aria-label="Interactive lesson workspace">
         <div className="canvas-toolbar"><div className="canvas-tabs" role="tablist" aria-label="Canvas tools">{[{id:'preview',label:'Preview',icon:'eye'},{id:'edit',label:'Edit lesson',icon:'sliders'},{id:'sources',label:'Sources',icon:'book'}].map(item=><button key={item.id} role="tab" aria-selected={tab===item.id} onClick={()=>setTab(item.id)}><Icon name={item.icon} size={16}/>{item.label}</button>)}</div><div className="canvas-actions"><button className="icon-button" aria-label="Undo last change" title="Undo last change" disabled={!lesson.history.length||Boolean(candidate)} onClick={()=>replaceLesson(undoLesson(lessonRef.current),'Previous version restored as a draft.')}><Icon name="undo" size={18}/></button><button className="icon-button" aria-label="Duplicate lesson" title="Duplicate lesson" onClick={duplicate}><Icon name="duplicate" size={18}/></button><div className="export-wrap"><button className="button secondary export-button" aria-label="Export lesson" onClick={()=>setExportOpen(!exportOpen)} aria-expanded={exportOpen}><Icon name="download" size={16}/><span>Export</span></button>{exportOpen&&<div className="export-menu"><button onClick={downloadImage} disabled={exporting}><Icon name="image"/><span><strong>{exporting?'Preparing image…':'Export PNG'}</strong><small>1080 × 1350 visual summary</small></span></button><button onClick={downloadJson}><Icon name="download"/><span><strong>Export JSON</strong><small>Keep an editable backup</small></span></button><button onClick={()=>{importRef.current?.click();setExportOpen(false);}}><Icon name="upload"/><span><strong>Import JSON</strong><small>Open an exported lesson</small></span></button></div>}</div></div></div>
-        {candidate&&<div className="candidate-banner"><div><Icon name="sparkles" size={18}/><span><strong>A new perspective, ready to try.</strong><small>Your saved version is safe until you choose this one.</small></span></div><div><button className="quiet-link" onClick={dismissSuggestion}>Keep current</button><button className="button primary" onClick={acceptSuggestion}><Icon name="check" size={16}/>Use this version</button></div></div>}
+        {candidate&&<div className="candidate-banner"><div><Icon name="sparkles" size={18}/><span><strong>{candidate.generationMode==='live'?'AI-generated suggestion':'A new perspective, ready to try.'}</strong><small>{candidate.generationMode==='live'?'Review the explanation and sources. Your saved version is safe until you choose this one.':'Your saved version is safe until you choose this one.'}</small></span></div><div><button className="quiet-link" onClick={dismissSuggestion}>Keep current</button><button className="button primary" onClick={acceptSuggestion}><Icon name="check" size={16}/>Use this version</button></div></div>}
         <div className="canvas-content">{tab==='preview'?<ZoneCanvas content={content} power={power} onPowerChange={setPower} candidate={Boolean(candidate)} onSetDefault={()=>applyContent({...copy(content),visual:{...content.visual,defaultPower:power}},`Starting power set to ${power} W.`)}/>:tab==='edit'?<EditPanel key={`${lesson.id}-${lesson.revision}-${candidate?'candidate':'current'}`} content={content} onApply={applyContent}/>:<SourcesPanel content={content} reviewed={reviewed} onReview={markReviewed}/>}</div>
         <div className="canvas-footer"><span className={`review-state ${reviewed?'reviewed':''}`}><span/>{candidate?'Suggestion · not applied':reviewed?'Reviewed by you':'Draft · review before sharing'}</span><span>Revision {lesson.revision}<span className="footer-dot">·</span>Saved on this browser only</span></div>
       </section>

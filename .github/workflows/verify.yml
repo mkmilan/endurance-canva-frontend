@@ -16,7 +16,7 @@ jobs:
   studio:
     name: Build and browser verification
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     defaults:
       run:
         shell: bash
@@ -24,7 +24,9 @@ jobs:
       NEXT_TELEMETRY_DISABLED: '1'
       BACKEND_API_URL: http://127.0.0.1:4000
       CANVAS_TEST_URL: http://127.0.0.1:3000
-      BACKEND_REF: 5790a2901212591a293313984f81058133cf8d17
+      STUDIO_ORIGIN: http://127.0.0.1:3000
+      TEST_MONGODB_URI: mongodb://127.0.0.1:27017/?replicaSet=canvas-test
+      BACKEND_REF: 80afd537d6b6896453ea4f09ef9050b2dfb85a49
     steps:
       - name: Set runtime paths
         run: |
@@ -34,6 +36,11 @@ jobs:
             printf 'PLAYWRIGHT_TOOLS_DIR=%s/endurance-canvas-playwright\n' "$RUNNER_TEMP"
             printf 'NODE_PATH=%s/endurance-canvas-playwright/node_modules\n' "$RUNNER_TEMP"
           } >> "$GITHUB_ENV"
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          fs.appendFileSync(process.env.GITHUB_ENV, `CANVAS_TEST_SETUP_TOKEN=${crypto.randomBytes(32).toString('hex')}\n`);
+          NODE
 
       - name: Check out the tested frontend revision
         uses: actions/checkout@v7
@@ -78,14 +85,38 @@ jobs:
           cd "$BACKEND_QA_DIR"
           npm ci --no-audit --no-fund
 
+      - name: Start an isolated MongoDB replica set for auth and quota tests
+        run: |
+          docker run --detach --name canvas-test-mongo --publish 127.0.0.1:27017:27017 mongo:8.0.34 --replSet canvas-test --bind_ip_all
+          for attempt in {1..30}; do
+            if docker exec canvas-test-mongo mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec canvas-test-mongo mongosh --quiet --eval 'rs.initiate({_id:"canvas-test",members:[{_id:0,host:"127.0.0.1:27017"}]})'
+          for attempt in {1..30}; do
+            if docker exec canvas-test-mongo mongosh --quiet --eval 'if (!db.hello().isWritablePrimary) quit(1)' >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs canvas-test-mongo
+          exit 1
+
+      - name: Verify the backend with real database transactions
+        run: |
+          cd "$BACKEND_QA_DIR"
+          npm test 2>&1 | tee "$CANVAS_QA_ARTIFACT_DIR/backend-tests.log"
+
       - name: Install the pinned browser tooling outside the repository
         run: |
           npm install --prefix "$PLAYWRIGHT_TOOLS_DIR" --no-save --ignore-scripts --no-audit --no-fund playwright@1.62.1
           "$PLAYWRIGHT_TOOLS_DIR/node_modules/.bin/playwright" install --with-deps chromium
 
-      - name: Start the local guided-demo services
+      - name: Start the studio with real auth and a labelled AI test fixture
         run: |
-          NODE_ENV=development AI_MODE=demo HOST=127.0.0.1 PORT=4000 node "$BACKEND_QA_DIR/src/server.js" > "$CANVAS_QA_ARTIFACT_DIR/backend.log" 2>&1 &
+          NODE_ENV=development HOST=127.0.0.1 PORT=4000 node "$BACKEND_QA_DIR/test/browser-server.js" > "$CANVAS_QA_ARTIFACT_DIR/backend.log" 2>&1 &
           echo "$!" > "$CANVAS_QA_ARTIFACT_DIR/backend.pid"
           NODE_ENV=production PORT=3000 npm start > "$CANVAS_QA_ARTIFACT_DIR/frontend.log" 2>&1 &
           echo "$!" > "$CANVAS_QA_ARTIFACT_DIR/frontend.pid"
@@ -106,13 +137,13 @@ jobs:
             throw new Error(`${url} was not ready: ${last}`);
           }
           Promise.all([
-            ready(`${process.env.BACKEND_API_URL}/health`, value => value.status === 'ok' && value.mode === 'demo'),
-            ready(`${process.env.CANVAS_TEST_URL}/api/status`, value => value.status === 'ok' && value.mode === 'demo' && value.liveGenerationAvailable === false)
+            ready(`${process.env.BACKEND_API_URL}/health`, value => value.status === 'ok'),
+            ready(`${process.env.CANVAS_TEST_URL}/api/creator`, value => value.status === 'ok' && value.auth?.configured && value.auth?.setupAvailable)
           ]).catch(error => { console.error(error); process.exitCode = 1; });
           NODE
 
       - name: Exercise the studio in bundled Chromium
-        timeout-minutes: 3
+        timeout-minutes: 5
         run: node tests/studio.e2e.cjs
 
       - name: Stop test services
@@ -123,6 +154,8 @@ jobs:
               kill "$(cat "$CANVAS_QA_ARTIFACT_DIR/$service.pid")" 2>/dev/null || true
             fi
           done
+          docker logs canvas-test-mongo > "$CANVAS_QA_ARTIFACT_DIR/mongodb.log" 2>&1 || true
+          docker rm --force canvas-test-mongo >/dev/null 2>&1 || true
 
       - name: Upload browser evidence and logs
         if: always()

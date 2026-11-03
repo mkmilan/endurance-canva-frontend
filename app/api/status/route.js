@@ -8,7 +8,7 @@ export async function GET() {
     const config = backendConfig();
     if (!config) return apiError('The lesson service is not connected yet. You can still explore and edit the canvas.', 503, 'NOT_CONFIGURED');
     const health = await backendHealth(config, 50000);
-    return Response.json({ status: 'ok', mode: health.mode, version: health.version, liveGenerationAvailable: false }, { headers: { 'Cache-Control': 'no-store' } });
+    return Response.json({ status: 'ok', mode: health.mode, version: health.version }, { headers: { 'Cache-Control': 'no-store' } });
   } catch {
     return apiError('The lesson service is waking up or unavailable. Your canvas and saved lessons are still here.');
   }

@@ -49,7 +49,7 @@ test('the generation route forwards a valid local-origin request to the demo bac
   const response = await POST(request('http://127.0.0.1:3000'));
   assert.equal(response.status, 200);
   assert.equal((await response.json()).requestId, 'origin-test');
-  assert.equal(fetchMock.mock.callCount(), 2);
+  assert.equal(fetchMock.mock.callCount(), 1);
 });
 
 test('the generation route rejects a foreign origin before making backend requests', async (t) => {

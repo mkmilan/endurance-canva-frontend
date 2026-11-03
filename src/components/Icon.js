@@ -1,4 +1,5 @@
 const paths = {
+  user: <><circle cx="12" cy="8" r="4"/><path d="M4 21v-2a8 8 0 0 1 16 0v2"/></>,
   sparkles: <><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/><path d="m20 2 .6 1.4L22 4l-1.4.6L20 6l-.6-1.4L18 4l1.4-.6Z"/></>,
   arrowUp: <><path d="M12 19V5m-6 6 6-6 6 6"/></>,
   arrowRight: <path d="M4 12h16m-6-6 6 6-6 6"/>,

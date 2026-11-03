@@ -4,6 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 
 const base = process.env.CANVAS_TEST_URL || 'http://127.0.0.1:3000';
 const out = process.env.CANVAS_QA_ARTIFACT_DIR || path.join(os.tmpdir(), 'endurance-canvas-qa');
@@ -12,7 +13,7 @@ const report = {
   frontendCommit: process.env.GITHUB_SHA || null,
   backendCommit: process.env.BACKEND_REF || null,
   baseUrl: base, checks: [], pageErrors: [], consoleErrors: [], artifacts: [],
-  scope: 'Production frontend build and pinned guided-demo backend running locally in CI. No real model calls or hosted-deployment assertions.',
+  scope: 'Production frontend build, pinned backend, and isolated MongoDB replica set in CI. Real owner setup, password/session checks, and durable quotas. Live AI responses are explicitly labelled test fixtures; no real model calls or hosted-deployment assertions.',
   visualReview: 'Screenshots and the exported PNG are evidence for human visual review; automated checks do not establish typography or scientific quality.'
 };
 let browser, context, page;
@@ -60,13 +61,14 @@ async function titleIs(value) {
   await page.waitForFunction(expected => document.querySelector('#lesson-title')?.textContent === expected, value);
 }
 
-async function generate(action) {
+async function generate(action, mode = 'demo') {
   const responsePromise = page.waitForResponse(response => new URL(response.url()).pathname === '/api/generate' && response.request().method() === 'POST');
   await action();
   const response = await responsePromise;
   assert.equal(response.status(), 200, 'The real local generation proxy must succeed');
   const result = await response.json();
-  assert.equal(result.mode, 'demo');
+  assert.equal(result.mode, mode);
+  Object.defineProperty(result, 'requestBody', { value: response.request().postDataJSON() });
   return result;
 }
 
@@ -210,6 +212,152 @@ async function run() {
       assert.equal(bytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
       assert.equal(bytes.readUInt32BE(16), 1080);
       assert.equal(bytes.readUInt32BE(20), 1350);
+    });
+
+    const creatorEmail = 'creator@example.invalid';
+    let creatorPassword = `Canvas-test-${crypto.randomBytes(18).toString('hex')}`;
+    const authHeaders = { Origin: base, 'Content-Type': 'application/json' };
+    await check('Opening creator access immediately after an edit flushes the local draft', async () => {
+      const title = 'Saved before opening creator access';
+      await page.getByRole('tab', { name: 'Edit lesson', exact: true }).click();
+      await page.getByLabel('Lesson title', { exact: true }).fill(title);
+      await page.getByRole('button', { name: 'Apply changes', exact: true }).click();
+      await page.getByRole('link', { name: 'Creator access', exact: true }).click();
+      await page.getByRole('heading', { name: 'Creator access.', exact: true }).waitFor();
+      await page.getByRole('link', { name: 'Back to studio', exact: true }).click();
+      await titleIs(title);
+      await saved();
+    });
+
+    await check('Guests cannot register publicly or request live generation', async () => {
+      const signup = await context.request.post(`${base}/api/auth/sign-up/email`, {
+        headers: authHeaders, data: { email: creatorEmail, name: 'Test creator', password: creatorPassword },
+      });
+      assert.equal(signup.status(), 404);
+      const live = await context.request.post(`${base}/api/generate`, {
+        headers: authHeaders, data: { mode: 'create', generationMode: 'live', prompt: 'Explain three training zones', requestId: 'unauthenticated-test' },
+      });
+      assert.equal(live.status(), 401);
+      assert.equal((await live.json()).error.code, 'OWNER_REQUIRED');
+    });
+
+    await check('One-time owner setup clears its token from the URL and creates a sign-in account', async () => {
+      assert.ok(process.env.CANVAS_TEST_SETUP_TOKEN, 'The CI fixture requires a temporary setup token');
+      await page.goto(`${base}/creator#setup=${process.env.CANVAS_TEST_SETUP_TOKEN}`, { waitUntil: 'domcontentloaded' });
+      await page.getByRole('heading', { name: 'Make it your studio.', exact: true }).waitFor();
+      assert.equal(new URL(page.url()).hash, '', 'Setup credentials must leave the address bar');
+      await page.getByLabel('Name', { exact: true }).fill('Test creator');
+      await page.getByLabel('Email', { exact: true }).fill(creatorEmail);
+      await page.getByLabel('Password', { exact: true }).fill(creatorPassword);
+      await page.getByRole('button', { name: 'Create creator account', exact: true }).click();
+      await page.getByText('Your creator account is ready. Sign in to continue.', { exact: true }).waitFor();
+      await page.getByRole('button', { name: 'Sign in', exact: true }).waitFor();
+      const closed = await context.request.get(`${base}/api/creator`);
+      const state = await closed.json();
+      assert.equal(state.auth.setupAvailable, false);
+      assert.equal(state.auth.signedIn, false);
+      assert.equal(state.auth.user, undefined, 'Public status must not reveal the owner email');
+    });
+
+    await check('Creator signs in with an HttpOnly session that survives reload', async () => {
+      await page.getByLabel('Email', { exact: true }).fill(creatorEmail);
+      await page.getByLabel('Password', { exact: true }).fill(creatorPassword);
+      await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+      await page.getByRole('heading', { name: 'Welcome back.', exact: true }).waitFor();
+      const cookies = await context.cookies(base);
+      const session = cookies.find(cookie => cookie.name.includes('endurance-canvas') && cookie.name.includes('session_token'));
+      assert.ok(session, 'Sign-in must set the backend session cookie on the frontend origin');
+      assert.equal(session.httpOnly, true);
+      assert.equal(session.sameSite, 'Lax');
+      // The CI fixture is HTTP localhost; production Secure-cookie behavior is
+      // asserted independently in the backend integration suite.
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.getByRole('heading', { name: 'Welcome back.', exact: true }).waitFor();
+      await screenshot('creator-signed-in.png');
+      await page.getByRole('link', { name: 'Continue to studio', exact: true }).click();
+      await saved();
+      await page.getByRole('button', { name: 'Live AI', exact: true }).waitFor();
+      assert.equal(await page.getByRole('button', { name: 'Guided demo', exact: true }).getAttribute('aria-pressed'), 'true');
+    });
+
+    let firstLiveRequest;
+    await check('Live AI is explicit, labelled, and offers a candidate without changing the saved lesson', async () => {
+      const previous = await snapshot();
+      await page.getByRole('button', { name: 'Live AI', exact: true }).click();
+      await page.getByText('LIVE AI', { exact: true }).waitFor();
+      await page.getByLabel('Describe your idea or ask for a change').fill('Use a short story about two gates to introduce this illustration.');
+      const result = await generate(() => page.getByRole('button', { name: 'Send message', exact: true }).click(), 'live');
+      assert.equal(result.status, 'ok');
+      assert.match(result.message, /test fixture/i);
+      firstLiveRequest = result.requestBody;
+      await page.getByText('CANVAS · AI GENERATED', { exact: true }).waitFor();
+      await page.getByText('AI-generated suggestion', { exact: true }).waitFor();
+      await page.getByText('2 of 3 attempts left today · 9 of 10 attempts left this month', { exact: true }).waitFor();
+      await screenshot('studio-live-fixture.png');
+      await page.getByRole('button', { name: 'Keep current', exact: true }).click();
+      assert.deepEqual(await snapshot(), previous);
+    });
+
+    await check('Duplicate IDs, foreign origins, and exhausted quota cannot make extra AI attempts', async () => {
+      const duplicate = await context.request.post(`${base}/api/generate`, { headers: authHeaders, data: firstLiveRequest });
+      assert.equal(duplicate.status(), 409);
+      assert.equal((await duplicate.json()).error.code, 'DUPLICATE_REQUEST');
+      const foreign = await context.request.post(`${base}/api/generate`, {
+        headers: { ...authHeaders, Origin: 'https://untrusted.example' },
+        data: { ...firstLiveRequest, requestId: 'foreign-origin-attempt' },
+      });
+      assert.equal(foreign.status(), 403);
+      for (let number = 2; number <= 3; number += 1) {
+        await page.getByLabel('Describe your idea or ask for a change').fill(`Make the explanation clearer, revision ${number}.`);
+        const result = await generate(() => page.getByRole('button', { name: 'Send message', exact: true }).click(), 'live');
+        assert.equal(result.status, 'ok');
+        await page.getByRole('button', { name: 'Keep current', exact: true }).click();
+      }
+      await page.getByText('0 of 3 attempts left today · 7 of 10 attempts left this month', { exact: true }).waitFor();
+      const previous = await snapshot();
+      const exhausted = await context.request.post(`${base}/api/generate`, {
+        headers: authHeaders, data: { ...firstLiveRequest, requestId: 'over-quota-attempt' },
+      });
+      assert.equal(exhausted.status(), 429);
+      assert.equal((await exhausted.json()).error.code, 'QUOTA_EXCEEDED');
+      const status = await (await context.request.get(`${base}/api/creator`)).json();
+      assert.equal(status.ai.limits.daily.used, 3);
+      assert.equal(status.ai.limits.monthly.used, 3);
+      assert.deepEqual(await snapshot(), previous);
+      await page.getByRole('button', { name: 'Guided demo', exact: true }).click();
+      const demo = await generate(() => page.getByRole('button', { name: 'Explain three training zones', exact: true }).click());
+      assert.equal(demo.status, 'ok', 'An exhausted AI allowance must not disable the guided demo');
+      await page.getByRole('button', { name: 'Keep current', exact: true }).click();
+    });
+
+    await check('Password change and sign-out work through the same-origin auth proxy', async () => {
+      await page.goto(`${base}/creator`, { waitUntil: 'domcontentloaded' });
+      await page.getByRole('heading', { name: 'Welcome back.', exact: true }).waitFor();
+      const nextPassword = `Canvas-new-${crypto.randomBytes(18).toString('hex')}`;
+      await page.getByLabel('Current password', { exact: true }).fill(creatorPassword);
+      await page.getByLabel('New password', { exact: true }).fill(nextPassword);
+      await page.getByRole('button', { name: 'Update password', exact: true }).click();
+      await page.getByText(/password.*updated|password.*changed/i).waitFor();
+      creatorPassword = nextPassword;
+      await page.getByRole('button', { name: 'Sign out', exact: true }).click();
+      await page.getByRole('button', { name: 'Sign in', exact: true }).waitFor();
+      const state = await (await context.request.get(`${base}/api/creator`)).json();
+      assert.equal(state.auth.signedIn, false);
+      const live = await context.request.post(`${base}/api/generate`, {
+        headers: authHeaders, data: { ...firstLiveRequest, requestId: 'signed-out-attempt' },
+      });
+      assert.equal(live.status(), 401, 'A revoked session must not reach generation or quotas');
+      await page.getByLabel('Email', { exact: true }).fill(creatorEmail);
+      await page.getByLabel('Password', { exact: true }).fill(creatorPassword);
+      await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+      await page.getByRole('heading', { name: 'Welcome back.', exact: true }).waitFor();
+      await page.getByRole('button', { name: 'Sign out', exact: true }).click();
+      await page.getByRole('button', { name: 'Sign in', exact: true }).waitFor();
+      await page.setViewportSize({ width: 360, height: 900 });
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+      await screenshot('creator-mobile.png');
+      await page.goto(base, { waitUntil: 'domcontentloaded' });
+      await saved();
     });
 
     await check('360 px canvas and conversation stay usable without horizontal overflow', async () => {
