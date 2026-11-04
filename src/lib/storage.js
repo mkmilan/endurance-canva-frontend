@@ -1,3 +1,5 @@
+import { exportLibrary, importLibrary, planLibraryRestore } from './library-backup.js';
+
 const DB_NAME = 'endurance-canvas-studio';
 let connection;
 
@@ -60,5 +62,44 @@ export async function deleteLocalLesson(id) {
     tx.objectStore('lessons').delete(id);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(new Error('Could not delete this lesson.'));
+  });
+}
+
+export async function exportLocalLibrary() {
+  const db = await database();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(['lessons', 'settings'], 'readonly');
+    const records = tx.objectStore('lessons').getAll();
+    const active = tx.objectStore('settings').get('activeLesson');
+    tx.oncomplete = () => {
+      try { resolve(exportLibrary(records.result, active.result)); }
+      catch (error) { reject(error); }
+    };
+    tx.onerror = () => reject(new Error('Could not read the complete library. Your lessons have not changed.'));
+    tx.onabort = tx.onerror;
+  });
+}
+
+export async function restoreLocalLibrary(backup) {
+  // Validate the complete archive before opening a write transaction.
+  importLibrary(backup);
+  const db = await database();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(['lessons', 'settings'], 'readwrite');
+    const store = tx.objectStore('lessons');
+    const existing = store.getAllKeys();
+    let result;
+    let restoreError;
+    existing.onsuccess = () => {
+      try {
+        result = planLibraryRestore(backup, existing.result);
+        // add() rather than put() makes replacement impossible even on a collision.
+        for (const lesson of result.lessons) store.add(lesson);
+        if (result.activeLessonId) tx.objectStore('settings').put(result.activeLessonId, 'activeLesson');
+      } catch (error) { restoreError = error; tx.abort(); }
+    };
+    tx.oncomplete = () => resolve(result);
+    tx.onerror = () => reject(restoreError || new Error('Could not restore this library. Your existing lessons are unchanged.'));
+    tx.onabort = tx.onerror;
   });
 }

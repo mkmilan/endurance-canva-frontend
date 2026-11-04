@@ -7,7 +7,8 @@ import EditPanel from './EditPanel.js';
 import SourcesPanel from './SourcesPanel.js';
 import { copy, createLesson, reviseLesson, undoLesson, exportLesson, importLesson, validStoredLesson, filename, downloadBlob } from '../lib/lessons.js';
 import { validateLesson } from '../generated/contracts/validation.js';
-import { saveLocalLesson, listLocalLessons, loadActiveLesson, deleteLocalLesson } from '../lib/storage.js';
+import { saveLocalLesson, listLocalLessons, loadActiveLesson, deleteLocalLesson, exportLocalLibrary, restoreLocalLibrary } from '../lib/storage.js';
+import { LIBRARY_FORMAT, MAX_LIBRARY_BYTES, importLibrary } from '../lib/library-backup.js';
 import { creatorRequest, signedOutCreator, attemptAllowance } from '../lib/creator.js';
 
 const initialMessage = { role: 'assistant', text: 'Let’s make an idea easier to understand. Start with three training zones, then ask me to simplify the explanation, add detail, or try another example.' };
@@ -34,6 +35,7 @@ export default function Studio() {
   const [exportOpen, setExportOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null);
+  const [libraryAction, setLibraryAction] = useState('');
   const requestRef = useRef(null);
   const autosaveRef = useRef(null);
   const transcriptRef = useRef(null);
@@ -114,9 +116,9 @@ export default function Studio() {
 
   useEffect(()=>{transcriptRef.current?.scrollTo({top:transcriptRef.current.scrollHeight,behavior:'smooth'});},[messages,pending,candidate]);
   useEffect(()=>{
-    function escape(event){if(event.key==='Escape'){setLibraryOpen(false);setExportOpen(false);setConfirmDelete(null);}}
+    function escape(event){if(event.key==='Escape'&&!libraryAction){setLibraryOpen(false);setExportOpen(false);setConfirmDelete(null);}}
     document.addEventListener('keydown',escape);return()=>document.removeEventListener('keydown',escape);
-  },[]);
+  },[libraryAction]);
 
   useEffect(()=>{
     if(!libraryOpen)return;
@@ -136,7 +138,7 @@ export default function Studio() {
   },[libraryOpen]);
 
   async function generate(text=prompt) {
-    const value=text.trim();if(!value || pending)return;
+    const value=text.trim();if(!value || pending || libraryAction)return;
     if(candidate){notify('Use or dismiss the current suggestion before asking for another.','error');return;}
     if(generationMode==='live' && !liveReady){notify('Live AI is not available right now. Choose the guided demo to keep exploring.','error');return;}
     const requestedMode=generationMode;
@@ -197,8 +199,8 @@ export default function Studio() {
   async function flushCurrent(){
     cancelRequest();clearTimeout(autosaveRef.current);
     const snapshot=lessonRef.current;
-    try{await saveLocalLesson(snapshot);if(lessonRef.current.id!==snapshot.id || lessonRef.current.revision!==snapshot.revision){notify('Your lesson changed while saving. Please try again.','error');return false;}return true;}
-    catch(error){notify(error.message,'error');return false;}
+    try{setSaveState('saving');await saveLocalLesson(snapshot);if(lessonRef.current.id!==snapshot.id || lessonRef.current.revision!==snapshot.revision){notify('Your lesson changed while saving. Please try again.','error');return false;}setSaveState('saved');return true;}
+    catch(error){setSaveState('error');notify(error.message,'error');return false;}
   }
   async function openCreator(event){
     // Modifier clicks open another tab and leave this draft mounted.
@@ -247,15 +249,51 @@ export default function Studio() {
     try{const{exportPng}=await import('../lib/export-image.js');await exportPng(content,power);notify('Visual summary downloaded as PNG.');setExportOpen(false);}
     catch(error){notify(error.message,'error');}finally{setExporting(false);}
   }
+  async function downloadLibrary(){
+    if(libraryAction||!ready)return;
+    setLibraryAction('backup');
+    try{
+      if(!await flushCurrent())return;
+      const backup=await exportLocalLibrary();
+      downloadBlob(new Blob([JSON.stringify(backup)],{type:'application/json'}),`endurance-canvas-library-${backup.exportedAt.slice(0,10)}.json`);
+      notify(`Library backup downloaded: ${backup.lessons.length} ${backup.lessons.length===1?'lesson':'lessons'}, including history and conversations.`);
+    }catch(error){notify(error.message,'error');}
+    finally{setLibraryAction('');}
+  }
   async function handleImport(event){
     const file=event.target.files?.[0];event.target.value='';if(!file)return;
+    if(libraryAction||!ready)return;
+    setLibraryAction('restore');
     try{
-      if(file.size>256000)throw new Error('This file is too large. Choose an Endurance Canvas JSON export under 256 KB.');
-      const result=importLesson(JSON.parse(await file.text()));
+      if(file.size>MAX_LIBRARY_BYTES)throw new Error('This file is too large. Choose a library backup under 8 MB.');
+      const value=JSON.parse(await file.text());
+      if(value?.format===LIBRARY_FORMAT){
+        const checked=importLibrary(value);
+        if(!checked.lessons.length){notify('This library backup is empty. Your existing lessons are unchanged.');return;}
+        if(!await flushCurrent())return;
+        const beforeRestore=lessonRef.current;
+        const result=await restoreLocalLibrary(value);
+        if(lessonRef.current!==beforeRestore){
+          // Preserve a queued edit/navigation that completed while the transaction was running.
+          // Its normal autosave remains active too; never switch it out from under the editor.
+          await saveLocalLesson(lessonRef.current);
+          setSaved((await listLocalLessons()).filter(validStoredLesson));
+          notify(`${result.restoredCount} ${result.restoredCount===1?'lesson':'lessons'} restored. Kept the lesson you are editing. Restored drafts need a fresh review.`);
+          return;
+        }
+        const active=result.lessons.find(entry=>entry.id===result.activeLessonId);
+        replaceLesson(active,`${result.restoredCount} ${result.restoredCount===1?'lesson':'lessons'} restored. Existing lessons kept. Restored drafts need a fresh review.`);
+        setMessages(active.conversation.length?active.conversation:[initialMessage]);
+        setPrompt('');setTab('preview');setLibraryOpen(false);setMobilePane('canvas');
+        return;
+      }
+      if(file.size>256000)throw new Error('This lesson file is too large. Choose a single-lesson export under 256 KB.');
+      const result=importLesson(value);
       if(!await flushCurrent())return;
       replaceLesson(result.lesson,'Lesson imported as an unreviewed draft. Sources were checked against the local catalogue.');
       setMessages([initialMessage]);setTab('preview');setLibraryOpen(false);setMobilePane('canvas');
     }catch(error){notify(error instanceof SyntaxError?'This file is not valid JSON. Your current lesson is unchanged.':error.message,'error');}
+    finally{setLibraryAction('');}
   }
   function markReviewed(){
     if(candidate){notify('Use this suggestion before reviewing it.','error');return;}
@@ -263,15 +301,15 @@ export default function Studio() {
     lessonRef.current=updated;setLesson(updated);notify('This revision is marked as reviewed by you.');
   }
 
-  return <div className="studio-app">
-    <header className="studio-header">
+  return <div className="studio-app" aria-busy={Boolean(libraryAction)}>
+    <header className="studio-header" inert={Boolean(libraryAction)}>
       <a className="brand" href="/" aria-label="Endurance Canvas home"><span className="brand-mark"><svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true"><path d="M7 24V13m9 11V7m9 17v-8" fill="none" stroke="currentColor" strokeWidth="4" strokeLinecap="round"/></svg></span><span>Endurance <strong>Canvas</strong></span></a>
       <span className="header-divider"/><span className="header-studio">Studio <span className="version-badge">EARLY ACCESS</span></span>
       <div className="header-actions"><span className={`save-indicator ${saveState}`}><span/>{saveState==='saved'?'Saved on this device':saveState==='saving'?'Saving…':saveState==='error'?'Not saved':'Opening studio…'}</span><a className="button ghost creator-link" href="/creator" onClick={openCreator} aria-label={creator.auth.signedIn?`Creator account: ${creator.auth.user?.name||'Creator'}`:'Creator access'}><Icon name="user"/><span>{creator.auth.signedIn?creator.auth.user?.name||'Creator':'Creator access'}</span></a><button className="button ghost library-button" aria-label="My lessons" onClick={openLibrary}><Icon name="folder"/><span>My lessons</span></button><button className="button primary header-save" aria-label="Save lesson" onClick={saveNow} disabled={!ready}><Icon name="save"/><span>Save lesson</span></button></div>
     </header>
-    <div className="workspace-heading"><div><span className="eyebrow">A LITTLE CURIOSITY. A CLEARER PICTURE.</span><h1>Make the science click<span>.</span></h1></div><button className="button secondary" onClick={startNew} disabled={!ready}><Icon name="plus"/>New lesson</button></div>
-    <div className="mobile-pane-tabs" role="tablist" aria-label="Workspace view"><button role="tab" aria-selected={mobilePane==='conversation'} onClick={()=>setMobilePane('conversation')}><Icon name="sparkles" size={16}/>Conversation{pending&&<span className="tab-dot"/>}</button><button role="tab" aria-selected={mobilePane==='canvas'} onClick={()=>setMobilePane('canvas')}><Icon name="eye" size={16}/>Your canvas{candidate&&<span className="tab-dot"/>}</button></div>
-    <main className={`workspace mobile-${mobilePane}`}>
+    <div className="workspace-heading" inert={Boolean(libraryAction)}><div><span className="eyebrow">A LITTLE CURIOSITY. A CLEARER PICTURE.</span><h1>Make the science click<span>.</span></h1></div><button className="button secondary" onClick={startNew} disabled={!ready}><Icon name="plus"/>New lesson</button></div>
+    <div className="mobile-pane-tabs" role="tablist" aria-label="Workspace view" inert={Boolean(libraryAction)}><button role="tab" aria-selected={mobilePane==='conversation'} onClick={()=>setMobilePane('conversation')}><Icon name="sparkles" size={16}/>Conversation{pending&&<span className="tab-dot"/>}</button><button role="tab" aria-selected={mobilePane==='canvas'} onClick={()=>setMobilePane('canvas')}><Icon name="eye" size={16}/>Your canvas{candidate&&<span className="tab-dot"/>}</button></div>
+    <main className={`workspace mobile-${mobilePane}`} inert={Boolean(libraryAction)}>
       <aside className="conversation-panel" aria-label="Lesson conversation">
         <div className="conversation-header"><span className="small-icon"><Icon name="sparkles" size={18}/></span><div><h2>Your thinking partner</h2><p>One idea, made interactive.</p></div><span className={`demo-badge ${generationMode==='live'?'live-badge':''}`}>{generationMode==='live'?'LIVE AI':'GUIDED DEMO'}</span></div>
         {creator.auth.signedIn&&<div className="generation-controls"><div className="generation-toggle" role="group" aria-label="Generation mode"><button type="button" aria-pressed={generationMode==='demo'} onClick={()=>setGenerationMode('demo')} disabled={pending}>Guided demo</button><button type="button" aria-pressed={generationMode==='live'} onClick={()=>setGenerationMode('live')} disabled={pending||!liveReady} aria-describedby="generation-availability"><Icon name="sparkles" size={13}/>Live AI</button></div><p className="generation-availability" id="generation-availability">{!creator.ai?.available?'The AI connection is not configured yet. Keep exploring with the guided demo.':allowance.exhausted?'Your AI allowance is used for now. The guided demo is still available.':'Live AI is ready when you choose it.'}</p>{creator.ai?.available&&allowance.description&&<p className="generation-allowance" aria-live="polite">{allowance.description}</p>}</div>}
@@ -295,7 +333,7 @@ export default function Studio() {
     </main>
     <footer className="studio-footer"><span>Built for curious minds and better explanations.</span><span>Endurance Canvas · Creator studio</span></footer>
     {notice&&<div className={`toast ${notice.kind}`} role={notice.kind==='error'?'alert':'status'}><Icon name={notice.kind==='error'?'info':'check'} size={18}/><span>{notice.text}</span><button className="icon-button" aria-label="Dismiss notification" onClick={()=>setNotice(null)}><Icon name="x" size={16}/></button></div>}
-    {libraryOpen&&<div className="drawer-overlay" onClick={()=>setLibraryOpen(false)}><section ref={drawerRef} className="library-drawer" role="dialog" aria-modal="true" aria-label="My saved lessons" onClick={event=>event.stopPropagation()}><div className="drawer-header"><div><span className="eyebrow">YOUR COLLECTION</span><h2>My lessons</h2></div><button className="icon-button" aria-label="Close saved lessons" onClick={()=>setLibraryOpen(false)}><Icon name="x"/></button></div><p className="drawer-intro">Saved on this device. Export JSON to keep a backup or move a lesson to another browser.</p><div className="library-actions"><button className="button primary" onClick={startNew}><Icon name="plus"/>New lesson</button><button className="button secondary" onClick={()=>importRef.current?.click()}><Icon name="upload"/>Import JSON</button></div><div className="library-list">{saved.length?saved.map(entry=><article className="saved-lesson" key={entry.id}><div className="saved-lesson-mini"><span/><span/><span/></div><div className="saved-lesson-details"><span className="eyebrow">THREE TRAINING ZONES</span><h3><button onClick={()=>openLesson(entry)}>{entry.content.title}</button></h3><p>{new Date(entry.updatedAt).toLocaleDateString('en-GB',{day:'numeric',month:'short'})} · Revision {entry.revision}{entry.id===lesson.id?' · Current lesson':''}</p></div>{confirmDelete===entry.id?<div className="delete-confirm"><span>Delete this lesson?</span><button onClick={()=>removeLesson(entry.id)}>Delete</button><button onClick={()=>setConfirmDelete(null)}>Cancel</button></div>:<button className="icon-button" aria-label={`Delete ${entry.content.title}`} onClick={()=>setConfirmDelete(entry.id)}><Icon name="trash" size={17}/></button>}</article>):<div className="empty-library"><Icon name="book" size={32}/><h3>A place for your ideas.</h3><p>Your saved explanations will appear here.</p></div>}</div></section></div>}
+    {libraryOpen&&<div className="drawer-overlay" onClick={()=>{if(!libraryAction)setLibraryOpen(false);}}><section ref={drawerRef} className="library-drawer" role="dialog" aria-modal="true" aria-label="My saved lessons" aria-busy={Boolean(libraryAction)} onClick={event=>event.stopPropagation()}><div className="drawer-header"><div><span className="eyebrow">YOUR COLLECTION</span><h2>My lessons</h2></div><button className="icon-button" aria-label="Close saved lessons" onClick={()=>setLibraryOpen(false)} disabled={Boolean(libraryAction)}><Icon name="x"/></button></div><p className="drawer-intro">Saved in this browser. Back up the whole library to keep your lessons, history, and conversations together.</p><div className="library-actions library-backup-actions"><button className="button primary" onClick={startNew} disabled={Boolean(libraryAction)}><Icon name="plus"/>New lesson</button><button className="button secondary" onClick={()=>importRef.current?.click()} disabled={Boolean(libraryAction)}><Icon name="upload"/>Import lesson</button><button className="button secondary" onClick={downloadLibrary} disabled={Boolean(libraryAction)}><Icon name="download"/>{libraryAction==='backup'?'Preparing…':'Back up library'}</button><button className="button secondary" onClick={()=>importRef.current?.click()} disabled={Boolean(libraryAction)}><Icon name="upload"/>{libraryAction==='restore'?'Restoring…':'Restore library'}</button></div><p className="library-backup-help">Restoring adds lessons without replacing existing work. Restored lessons need a fresh review.</p>{candidate&&<p className="library-backup-help">Apply your pending suggestion first if you want it included in the backup.</p>}<div className="library-list">{saved.length?saved.map(entry=><article className="saved-lesson" key={entry.id}><div className="saved-lesson-mini"><span/><span/><span/></div><div className="saved-lesson-details"><span className="eyebrow">THREE TRAINING ZONES</span><h3><button onClick={()=>openLesson(entry)} disabled={Boolean(libraryAction)}>{entry.content.title}</button></h3><p>{new Date(entry.updatedAt).toLocaleDateString('en-GB',{day:'numeric',month:'short'})} · Revision {entry.revision}{entry.id===lesson.id?' · Current lesson':''}</p></div>{confirmDelete===entry.id?<div className="delete-confirm"><span>Delete this lesson?</span><button onClick={()=>removeLesson(entry.id)} disabled={Boolean(libraryAction)}>Delete</button><button onClick={()=>setConfirmDelete(null)} disabled={Boolean(libraryAction)}>Cancel</button></div>:<button className="icon-button" aria-label={`Delete ${entry.content.title}`} onClick={()=>setConfirmDelete(entry.id)} disabled={Boolean(libraryAction)}><Icon name="trash" size={17}/></button>}</article>):<div className="empty-library"><Icon name="book" size={32}/><h3>A place for your ideas.</h3><p>Your saved explanations will appear here.</p></div>}</div></section></div>}
     <input ref={importRef} type="file" accept=".json,application/json" className="sr-only" onChange={handleImport} aria-label="Import lesson JSON file"/>
   </div>;
 }
